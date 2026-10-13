@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#111827">
+<title>Sıralı Video Editörü</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:20px 14px;background:#111827;color:#f9fafb;font-family:system-ui,sans-serif}
+main{max-width:600px;margin:auto}
+h1{font-size:27px;margin:5px 0}
+h2{font-size:19px;margin:0 0 12px}
+p,.hint{color:#cbd5e1;font-size:14px;line-height:1.55}
+.panel{padding:17px;margin:15px 0;background:#1f2937;border:1px solid #374151;border-radius:17px}
+input,select,button{font:inherit}
+input[type=file]{width:100%;margin:12px 0}
+select{width:100%;padding:12px;border-radius:10px;background:#111827;color:white;border:1px solid #4b5563}
+button{border:0;border-radius:10px;padding:10px 12px;background:#374151;color:white;cursor:pointer}
+button:disabled{opacity:.5}
+.primary{width:100%;margin-top:14px;padding:14px;background:#2563eb;font-weight:700}
+.clip{display:flex;align-items:center;gap:7px;margin-top:9px;padding:10px;background:#111827;border:1px solid #374151;border-radius:12px}
+.clip.dragging{opacity:.45;border-color:#60a5fa}
+.handle{font-size:21px;cursor:grab;padding:5px}
+.clip-name{flex:1;min-width:0;overflow-wrap:anywhere;font-size:13px}
+.small{padding:8px}
+label{display:block;font-size:14px;margin:12px 0 6px}
+input[type=range]{width:100%;accent-color:#60a5fa}
+.row{display:flex;align-items:center;gap:10px}
+.row input{width:20px;height:20px;accent-color:#2563eb}
+.row label{margin:8px 0}
+#status{overflow-wrap:anywhere}
+#download{display:none;color:#93c5fd;font-weight:700;display:none;margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>🎬 Sıralı Video Editörü</h1>
+<p>Kliplerini sırala, müziğini ekle ve MP4 videonu oluştur.</p>
+
+<section class="panel">
+<h2>1. Video klipleri</h2>
+<p>Kliplerini seç. Sıralamayı değiştirmek için tutma simgesini sürükle veya ok düğmelerini kullan.</p>
+<input id="videos" type="file" accept="video/*" multiple>
+<div id="clipList"></div>
+</section>
+
+<section class="panel">
+<h2>2. Video formatı</h2>
+<label for="ratio">Çıktı boyutu</label>
+<select id="ratio">
+<option value="9:16">Dikey 9:16 — Reels / TikTok / Shorts</option>
+<option value="16:9">Yatay 16:9 — YouTube / geniş ekran</option>
+</select>
+<p>Görüntü seçtiğin formata sığdırılır; boş alanlar siyah olur.</p>
+</section>
+
+<section class="panel">
+<h2>3. Müzik ve orijinal ses</h2>
+<label for="audio">Müzik dosyası</label>
+<input id="audio" type="file" accept="audio/*">
+<p id="audioName">Henüz müzik seçilmedi.</p>
+
+<label for="volume">Müzik seviyesi: <strong id="volumeLabel">70%</strong></label>
+<input id="volume" type="range" min="0" max="100" value="70">
+
+<div class="row">
+<input id="keepAudio" type="checkbox" checked>
+<label for="keepAudio">Kliplerin orijinal sesini koru</label>
+</div>
+<p>İşaretliyse kliplerin sesi müzikle birlikte duyulur. Kaldırırsan yalnızca müzik kullanılır.</p>
+</section>
+
+<section class="panel">
+<h2>4. Videonu oluştur</h2>
+<p>Kliplerin sırası korunur. Uzun projelerin işlenmesi daha fazla zaman alabilir.</p>
+<button class="primary" id="export">MP4 videomu oluştur</button>
+<p id="status" role="status">Videolarını ve müziğini seçmeye hazırsın.</p>
+<a id="download" href="">⬇ Videonu indir</a>
+</section>
+</main>
+
+<script>
+const videoInput=document.querySelector("#videos");
+const audioInput=document.querySelector("#audio");
+const list=document.querySelector("#clipList");
+const status=document.querySelector("#status");
+const exportButton=document.querySelector("#export");
+const downloadLink=document.querySelector("#download");
+let clips=[];
+let dragIndex=null;
+
+videoInput.addEventListener("change",()=>{
+  clips=Array.from(videoInput.files||[]);
+  renderClips();
+  status.textContent=clips.length+" klip seçildi.";
+  downloadLink.style.display="none";
+});
+
+function moveClip(from,to){
+  if(to<0||to>=clips.length||from===to)return;
+  const item=clips.splice(from,1)[0];
+  clips.splice(to,0,item);
+  renderClips();
+}
+
+function renderClips(){
+  list.replaceChildren();
+  clips.forEach((file,index)=>{
+    const row=document.createElement("div");
+    row.className="clip";
+    row.draggable=true;
+    row.dataset.index=index;
+
+    const handle=document.createElement("span");
+    handle.className="handle";
+    handle.textContent="⠿";
+    handle.title="Sürükleyerek sırala";
+
+    const name=document.createElement("span");
+    name.className="clip-name";
+    name.textContent=(index+1)+". "+file.name;
+
+    const up=document.createElement("button");
+    up.className="small";
+    up.textContent="↑";
+    up.disabled=index===0;
+    up.setAttribute("aria-label","Yukarı taşı");
+    up.onclick=()=>moveClip(index,index-1);
+
+    const down=document.createElement("button");
+    down.className="small";
+    down.textContent="↓";
+    down.disabled=index===clips.length-1;
+    down.setAttribute("aria-label","Aşağı taşı");
+    down.onclick=()=>moveClip(index,index+1);
+
+    const remove=document.createElement("button");
+    remove.className="small";
+    remove.textContent="Sil";
+    remove.onclick=()=>{
+      clips.splice(index,1);
+      renderClips();
+      status.textContent="Klip kaldırıldı.";
+    };
+
+    row.addEventListener("dragstart",e=>{
+      dragIndex=index;
+      row.classList.add("dragging");
+      if(e.dataTransfer)e.dataTransfer.effectAllowed="move";
+    });
+    row.addEventListener("dragend",()=>{
+      row.classList.remove("dragging");
+    });
+    row.addEventListener("dragover",e=>e.preventDefault());
+    row.addEventListener("drop",e=>{
+      e.preventDefault();
+      if(dragIndex!==null){
+        moveClip(dragIndex,index);
+        dragIndex=null;
+      }
+    });
+
+    row.append(handle,name,up,down,remove);
+    list.append(row);
+  });
+}
+
+audioInput.addEventListener("change",()=>{
+  const f=audioInput.files?.[0];
+  document.querySelector("#audioName").textContent=
+    f?"Seçildi: "+f.name:"Henüz müzik seçilmedi.";
+});
+
+document.querySelector("#volume").addEventListener("input",e=>{
+  document.querySelector("#volumeLabel").textContent=e.target.value+"%";
+});
+
+exportButton.addEventListener("click",async()=>{
+  const audio=audioInput.files?.[0];
+  if(!clips.length||!audio){
+    status.textContent="Lütfen en az bir video ve bir müzik dosyası seç.";
+    return;
+  }
+
+  exportButton.disabled=true;
+  downloadLink.style.display="none";
+  status.textContent="Videolar işleniyor. Sayfayı kapatma; lütfen bekle.";
+
+  try{
+    const form=new FormData();
+    clips.forEach((file,index)=>{
+      form.append("clips",file,file.name||("clip_"+index+".mp4"));
+    });
+    form.append("audio",audio,audio.name);
+    form.append("aspect_ratio",document.querySelector("#ratio").value);
+    form.append("music_volume",String(
+      Number(document.querySelector("#volume").value)/100
+    ));
+    form.append("keep_original_audio",
+      String(document.querySelector("#keepAudio").checked));
+
+    const response=await fetch("/render",{method:"POST",body:form});
+    if(!response.ok){
+      const detail=await response.text();
+      throw new Error(detail);
+    }
+
+    const data=await response.json();
+    downloadLink.href=data.download_url;
+    downloadLink.style.display="block";
+    status.textContent="MP4 hazır! Aşağıdaki bağlantıya dokun.";
+  }catch(error){
+    status.textContent="İşlem hatası: "+
+      (error instanceof Error?error.message:"Bilinmeyen hata");
+  }finally{
+    exportButton.disabled=false;
+  }
+});
+</script>
+</body>
+</html>
