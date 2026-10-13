@@ -114,7 +114,7 @@ async def render(
         joined = job / "joined.mp4"
         run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", listing.name, "-c", "copy", str(joined)
+            "-i", listing.name, "-c", "copy", joined.name
         ], cwd=str(job))
 
         output = job / "output.mp4"
