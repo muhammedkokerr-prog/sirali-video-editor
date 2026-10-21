@@ -1,0 +1,2 @@
+file '/workspaces/sirali-video-editor/work/8a01db45248b40618ca96444b250a50a/clip_0.mp4'
+file '/workspaces/sirali-video-editor/work/8a01db45248b40618ca96444b250a50a/clip_1.mp4'
