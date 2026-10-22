@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -12,10 +13,20 @@ app = FastAPI()
 BASE = Path("work")
 BASE.mkdir(exist_ok=True)
 
+# Çıktı boyutları. Ücretsiz Render planında 720p güvenli.
+# Ücretli plana geçersen (1080, 1920) / (1920, 1080) yapabilirsin.
+SIZES = {"9:16": (720, 1280), "16:9": (1280, 720)}
+
+# Eski iş klasörleri bu süre sonra silinir (saniye)
+JOB_MAX_AGE = 3 * 60 * 60
+
 # Arka plan işleri için durum tablosu ve tek seferde 1 iş sınırı (RAM'i korur)
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 RENDER_SLOT = threading.Semaphore(1)
+
+# Düşük bellek için ortak ffmpeg ayarları
+FF_QUIET = ["-hide_banner", "-loglevel", "error", "-nostats"]
 
 
 def run(cmd, timeout=900, cwd=None):
@@ -31,6 +42,19 @@ def run(cmd, timeout=900, cwd=None):
 def set_status(job_id, **kwargs):
     with JOBS_LOCK:
         JOBS.setdefault(job_id, {}).update(kwargs)
+
+
+def cleanup_old_jobs():
+    """Eski iş klasörlerini sil (diski doldurmasın)."""
+    now = time.time()
+    for p in BASE.iterdir():
+        try:
+            if p.is_dir() and now - p.stat().st_mtime > JOB_MAX_AGE:
+                shutil.rmtree(p, ignore_errors=True)
+                with JOBS_LOCK:
+                    JOBS.pop(p.name, None)
+        except Exception:
+            pass
 
 
 def build_video(job_id, job, sources, audio_path, width, height,
@@ -53,12 +77,15 @@ def build_video(job_id, job, sources, audio_path, width, height,
                 target = job / f"clip_{i:03d}.mp4"
 
                 vf = (
+                    "fps=30,"
                     f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                     f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-                    "setsar=1,fps=30,format=yuv420p"
+                    "setsar=1,format=yuv420p"
                 )
 
-                cmd = ["ffmpeg", "-y", "-threads", "1", "-i", str(source)]
+                cmd = ["ffmpeg", "-y", *FF_QUIET,
+                       "-threads", "1", "-filter_threads", "1",
+                       "-i", str(source)]
 
                 if has_audio and keep_original_audio:
                     cmd += [
@@ -75,6 +102,7 @@ def build_video(job_id, job, sources, audio_path, width, height,
                     ]
 
                 cmd += [
+                    "-threads", "1",
                     "-c:v", "libx264", "-preset", "ultrafast",
                     "-crf", "23", "-pix_fmt", "yuv420p",
                     "-ar", "44100", "-ac", "2", "-shortest",
@@ -94,13 +122,14 @@ def build_video(job_id, job, sources, audio_path, width, height,
 
             joined = job / "joined.mp4"
             run([
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "ffmpeg", "-y", *FF_QUIET, "-f", "concat", "-safe", "0",
                 "-i", listing.name, "-c", "copy", joined.name
             ], cwd=str(job))
 
             output = job / "output.mp4"
             cmd = [
-                "ffmpeg", "-y", "-i", str(joined),
+                "ffmpeg", "-y", *FF_QUIET, "-threads", "1",
+                "-i", str(joined),
                 "-stream_loop", "-1", "-i", str(audio_path),
             ]
 
@@ -152,7 +181,7 @@ def home():
     return FileResponse("index.html")
 
 
-# ---------- YENİ: arka plan tabanlı render ----------
+# ---------- Arka plan tabanlı render ----------
 @app.post("/render_start")
 async def render_start(
     clips: list[UploadFile] = File(...),
@@ -163,14 +192,16 @@ async def render_start(
 ):
     if not clips:
         raise HTTPException(400, "En az bir video seçmelisin.")
-    if aspect_ratio not in ("9:16", "16:9"):
+    if aspect_ratio not in SIZES:
         raise HTTPException(400, "Geçersiz video formatı.")
     if not 0 <= music_volume <= 1:
         raise HTTPException(400, "Ses seviyesi 0 ile 1 arasında olmalı.")
     if len(clips) > 30:
         raise HTTPException(400, "Tek seferde en fazla 30 klip seçebilirsin.")
 
-    width, height = (1080, 1920) if aspect_ratio == "9:16" else (1920, 1080)
+    cleanup_old_jobs()
+
+    width, height = SIZES[aspect_ratio]
     job_id = uuid.uuid4().hex
     job = BASE / job_id
     job.mkdir(parents=True)
@@ -218,8 +249,152 @@ def status(job_id: str):
         return dict(info)
 
 
-# ---------- ESKİ: aynen duruyor ----------
+# ---------- ESKİ: mantık aynen duruyor ----------
 @app.post("/render")
 async def render(
     clips: list[UploadFile] = File(...),
     audio: UploadFile = File(...),
+    aspect_ratio: str = Form("9:16"),
+    music_volume: float = Form(0.7),
+    keep_original_audio: bool = Form(True),
+):
+    if not clips:
+        raise HTTPException(400, "En az bir video seçmelisin.")
+    if aspect_ratio not in SIZES:
+        raise HTTPException(400, "Geçersiz video formatı.")
+    if not 0 <= music_volume <= 1:
+        raise HTTPException(400, "Ses seviyesi 0 ile 1 arasında olmalı.")
+    if len(clips) > 30:
+        raise HTTPException(400, "Tek seferde en fazla 30 klip seçebilirsin.")
+
+    width, height = SIZES[aspect_ratio]
+    job_id = uuid.uuid4().hex
+    job = BASE / job_id
+    job.mkdir(parents=True)
+
+    try:
+        normalized = []
+
+        for i, clip in enumerate(clips):
+            source = job / f"source_{i}"
+            with source.open("wb") as f:
+                shutil.copyfileobj(clip.file, f)
+
+            probe = run([
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "csv=p=0", str(source)
+            ], timeout=60)
+
+            has_audio = bool(probe.stdout.strip())
+            target = job / f"clip_{i:03d}.mp4"
+
+            vf = (
+                "fps=30,"
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+                "setsar=1,format=yuv420p"
+            )
+
+            cmd = ["ffmpeg", "-y", *FF_QUIET,
+                   "-threads", "1", "-filter_threads", "1",
+                   "-i", str(source)]
+
+            if has_audio and keep_original_audio:
+                cmd += [
+                    "-map", "0:v:0", "-map", "0:a:0",
+                    "-vf", vf, "-af", "aresample=44100,apad",
+                    "-c:a", "aac", "-b:a", "160k",
+                ]
+            else:
+                cmd += [
+                    "-f", "lavfi", "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-vf", vf, "-c:a", "aac", "-b:a", "160k",
+                ]
+
+            cmd += [
+                "-threads", "1",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", "23", "-pix_fmt", "yuv420p",
+                "-ar", "44100", "-ac", "2", "-shortest",
+                str(target)
+            ]
+            run(cmd)
+            normalized.append(target)
+
+        audio_path = job / "music"
+        suffix = Path(audio.filename or "music.mp3").suffix or ".mp3"
+        audio_path = audio_path.with_suffix(suffix)
+        with audio_path.open("wb") as f:
+            shutil.copyfileobj(audio.file, f)
+
+        listing = job / "list.txt"
+        with listing.open("w", encoding="utf-8") as f:
+            for path in normalized:
+                f.write(f"file '{path.name}'\n")
+
+        joined = job / "joined.mp4"
+        run([
+            "ffmpeg", "-y", *FF_QUIET, "-f", "concat", "-safe", "0",
+            "-i", listing.name, "-c", "copy", joined.name
+        ], cwd=str(job))
+
+        output = job / "output.mp4"
+        cmd = [
+            "ffmpeg", "-y", *FF_QUIET, "-threads", "1",
+            "-i", str(joined),
+            "-stream_loop", "-1", "-i", str(audio_path),
+        ]
+
+        volume = f"{music_volume:.3f}"
+
+        if keep_original_audio:
+            cmd += [
+                "-filter_complex",
+                f"[0:a]volume=1[original];"
+                f"[1:a]volume={volume}[music];"
+                "[original][music]amix=inputs=2:duration=first:"
+                "dropout_transition=2[aout]",
+                "-map", "0:v:0", "-map", "[aout]",
+            ]
+        else:
+            cmd += [
+                "-filter_complex", f"[1:a]volume={volume}[aout]",
+                "-map", "0:v:0", "-map", "[aout]",
+            ]
+
+        cmd += [
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", "-shortest", str(output)
+        ]
+        run(cmd)
+
+        return {"download_url": f"/download/{job_id}"}
+
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(job, ignore_errors=True)
+        raise HTTPException(504, "Video işlemi zaman aşımına uğradı.")
+    except Exception as e:
+        shutil.rmtree(job, ignore_errors=True)
+        raise HTTPException(500, f"Video oluşturulamadı: {e}")
+    finally:
+        for clip in clips:
+            await clip.close()
+        await audio.close()
+
+
+@app.get("/download/{job_id}")
+def download(job_id: str):
+    if not job_id.isalnum():
+        raise HTTPException(400, "Geçersiz işlem numarası.")
+
+    output = BASE / job_id / "output.mp4"
+    if not output.is_file():
+        raise HTTPException(404, "Video bulunamadı.")
+
+    return FileResponse(
+        output, media_type="video/mp4", filename="videom.mp4"
+    )
