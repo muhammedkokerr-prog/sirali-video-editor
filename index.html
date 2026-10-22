@@ -90,6 +90,11 @@ const downloadLink=document.querySelector("#download");
 let clips=[];
 let dragIndex=null;
 
+const POLL_MS=2000;
+const JOB_KEY="sve_job_id";
+
+class FatalError extends Error{}
+
 videoInput.addEventListener("change",()=>{
   clips=Array.from(videoInput.files||[]);
   renderClips();
@@ -176,6 +181,109 @@ document.querySelector("#volume").addEventListener("input",e=>{
   document.querySelector("#volumeLabel").textContent=e.target.value+"%";
 });
 
+/* ---------- iş numarasını hatırla (sayfa yenilenirse devam etsin) ---------- */
+function saveJob(id){try{localStorage.setItem(JOB_KEY,id);}catch(e){}}
+function getJob(){try{return localStorage.getItem(JOB_KEY);}catch(e){return null;}}
+function clearJob(){try{localStorage.removeItem(JOB_KEY);}catch(e){}}
+
+/* ---------- hata mesajını kısa ve anlaşılır yap ---------- */
+function friendlyHttpError(code,text){
+  if(code===502||code===503||code===504){
+    return "Sunucu yanıt vermedi ("+code+"). Birkaç dakika sonra tekrar dene.";
+  }
+  try{
+    const j=JSON.parse(text);
+    if(j&&j.detail)return String(j.detail).slice(0,300);
+  }catch(e){}
+  return ("HTTP "+code+" "+String(text||"")).replace(/<[^>]*>/g," ").slice(0,200);
+}
+
+/* ---------- klipleri yükle (yüzde göstererek) ---------- */
+function uploadWithProgress(form){
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();
+    xhr.open("POST","/render_start");
+    xhr.upload.onprogress=e=>{
+      if(e.lengthComputable){
+        status.textContent="Yükleniyor: %"+
+          Math.round(e.loaded/e.total*100)+" — sayfayı kapatma.";
+      }
+    };
+    xhr.onload=()=>{
+      if(xhr.status>=200&&xhr.status<300){
+        try{
+          resolve(JSON.parse(xhr.responseText));
+        }catch(e){
+          reject(new FatalError("Sunucu yanıtı okunamadı."));
+        }
+      }else{
+        reject(new FatalError(
+          friendlyHttpError(xhr.status,xhr.responseText)
+        ));
+      }
+    };
+    xhr.onerror=()=>reject(new FatalError(
+      "Yükleme sırasında bağlantı koptu. Tekrar dene."
+    ));
+    xhr.ontimeout=()=>reject(new FatalError("Yükleme zaman aşımına uğradı."));
+    xhr.send(form);
+  });
+}
+
+/* ---------- işin bitmesini bekle ---------- */
+async function pollJob(jobId){
+  let failures=0;
+  while(true){
+    await new Promise(r=>setTimeout(r,POLL_MS));
+    let s;
+    try{
+      const r=await fetch("/status/"+jobId,{cache:"no-store"});
+      if(r.status===404){
+        throw new FatalError(
+          "İşlem bulunamadı (sunucu yeniden başlamış olabilir). Lütfen tekrar dene."
+        );
+      }
+      if(!r.ok)throw new Error("HTTP "+r.status);
+      s=await r.json();
+      failures=0;
+    }catch(err){
+      if(err instanceof FatalError)throw err;
+      failures++;
+      if(failures>=8){
+        throw new Error(
+          "Sunucuya ulaşılamıyor. Sayfayı yenileyip tekrar açarsan işlem kontrol edilir."
+        );
+      }
+      status.textContent="Bağlantı bekleniyor... ("+failures+"/8)";
+      continue;
+    }
+
+    if(s.state==="done")return s.download_url;
+    if(s.state==="error"){
+      throw new FatalError(s.error||"Bilinmeyen hata");
+    }
+    if(s.state==="queued"){
+      status.textContent="Sıraya alındı...";
+    }else if(s.total&&s.done>=s.total){
+      status.textContent="Klipler birleştiriliyor ve müzik ekleniyor...";
+    }else{
+      status.textContent="İşleniyor: "+(s.done||0)+"/"+(s.total||"?")+
+        " klip — sayfayı kapatma.";
+    }
+  }
+}
+
+function showResult(url){
+  downloadLink.href=url;
+  downloadLink.style.display="block";
+  status.textContent="MP4 hazır! Aşağıdaki bağlantıya dokun.";
+}
+
+function showError(error){
+  status.textContent="İşlem hatası: "+
+    (error instanceof Error?error.message:"Bilinmeyen hata");
+}
+
 exportButton.addEventListener("click",async()=>{
   const audio=audioInput.files?.[0];
   if(!clips.length||!audio){
@@ -185,7 +293,7 @@ exportButton.addEventListener("click",async()=>{
 
   exportButton.disabled=true;
   downloadLink.style.display="none";
-  status.textContent="Videolar işleniyor. Sayfayı kapatma; lütfen bekle.";
+  status.textContent="Yükleme başlıyor...";
 
   try{
     const form=new FormData();
@@ -200,23 +308,38 @@ exportButton.addEventListener("click",async()=>{
     form.append("keep_original_audio",
       String(document.querySelector("#keepAudio").checked));
 
-    const response=await fetch("/render",{method:"POST",body:form});
-    if(!response.ok){
-      const detail=await response.text();
-      throw new Error(detail);
-    }
+    const data=await uploadWithProgress(form);
+    saveJob(data.job_id);
+    status.textContent="Yükleme tamam. İşlem başlıyor...";
 
-    const data=await response.json();
-    downloadLink.href=data.download_url;
-    downloadLink.style.display="block";
-    status.textContent="MP4 hazır! Aşağıdaki bağlantıya dokun.";
+    const url=await pollJob(data.job_id);
+    clearJob();
+    showResult(url);
   }catch(error){
-    status.textContent="İşlem hatası: "+
-      (error instanceof Error?error.message:"Bilinmeyen hata");
+    if(error instanceof FatalError)clearJob();
+    showError(error);
   }finally{
     exportButton.disabled=false;
   }
 });
+
+/* ---------- sayfa açılınca yarım kalan iş varsa devam et ---------- */
+(async()=>{
+  const id=getJob();
+  if(!id)return;
+  exportButton.disabled=true;
+  status.textContent="Önceki işlem kontrol ediliyor...";
+  try{
+    const url=await pollJob(id);
+    clearJob();
+    showResult(url);
+  }catch(error){
+    if(error instanceof FatalError)clearJob();
+    showError(error);
+  }finally{
+    exportButton.disabled=false;
+  }
+})();
 </script>
 </body>
 </html>
