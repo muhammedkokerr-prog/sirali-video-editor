@@ -20,6 +20,9 @@ SIZES = {"9:16": (720, 1280), "16:9": (1280, 720)}
 # Eski iş klasörleri bu süre sonra silinir (saniye)
 JOB_MAX_AGE = 3 * 60 * 60
 
+# Müzik bittiğinde (veya video bittiğinde) sesin yumuşakça kısılma süresi (saniye)
+MUSIC_FADE = 1.5
+
 # Arka plan işleri için durum tablosu ve tek seferde 1 iş sınırı (RAM'i korur)
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -57,104 +60,165 @@ def cleanup_old_jobs():
             pass
 
 
+def probe_duration(path, stream=None):
+    """Dosyanın süresini saniye olarak döndürür. Bulunamazsa None."""
+    attempts = []
+    if stream:
+        attempts.append([
+            "ffprobe", "-v", "error", "-select_streams", stream,
+            "-show_entries", "stream=duration",
+            "-of", "csv=p=0", str(path)
+        ])
+    attempts.append([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0", str(path)
+    ])
+    for cmd in attempts:
+        try:
+            lines = run(cmd, timeout=60).stdout.strip().splitlines()
+            value = float(lines[0]) if lines else 0.0
+            if value > 0:
+                return value
+        except Exception:
+            continue
+    return None
+
+
+def normalize_clip(source, target, width, height, keep_original_audio):
+    """Bir klibi ortak formata çevirir.
+    Görüntü ve ses süresi birebir eşitlenir; böylece klip geçişlerinde
+    donma olmaz."""
+    probe = run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "csv=p=0", str(source)
+    ], timeout=60)
+    has_audio = bool(probe.stdout.strip())
+    duration = probe_duration(source, "v:0")
+
+    vf = (
+        "fps=30,"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        "setsar=1,format=yuv420p"
+    )
+
+    cmd = ["ffmpeg", "-y", *FF_QUIET,
+           "-threads", "1", "-filter_threads", "1",
+           "-i", str(source)]
+
+    if has_audio and keep_original_audio:
+        cmd += [
+            "-map", "0:v:0", "-map", "0:a:0",
+            "-vf", vf, "-af", "aresample=44100,apad",
+            "-c:a", "aac", "-b:a", "160k",
+        ]
+    else:
+        cmd += [
+            "-f", "lavfi", "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-vf", vf, "-c:a", "aac", "-b:a", "160k",
+        ]
+
+    cmd += [
+        "-threads", "1",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-crf", "23", "-pix_fmt", "yuv420p",
+        "-ar", "44100", "-ac", "2",
+    ]
+
+    if duration:
+        # Hem görüntü hem ses tam olarak klibin görüntü süresi kadar olsun
+        cmd += ["-t", f"{duration:.3f}"]
+    else:
+        cmd += ["-shortest"]
+
+    cmd += ["-avoid_negative_ts", "make_zero", str(target)]
+    run(cmd)
+
+
+def concat_clips(job, clips):
+    """Hazır klipleri yeniden kodlamadan uç uca ekler."""
+    listing = job / "list.txt"
+    with listing.open("w", encoding="utf-8") as f:
+        for path in clips:
+            f.write(f"file '{path.name}'\n")
+
+    joined = job / "joined.mp4"
+    run([
+        "ffmpeg", "-y", *FF_QUIET, "-f", "concat", "-safe", "0",
+        "-i", listing.name, "-c", "copy", joined.name
+    ], cwd=str(job))
+    return joined
+
+
+def mix_final(joined, audio_path, output, music_volume, keep_original_audio):
+    """Müziği ekler. Müzik başa sarılmaz; bir kez çalar ve sonunda yumuşakça
+    kısılır. Video müzikten uzunsa kalan kısımda orijinal ses devam eder."""
+    video_dur = probe_duration(joined, "v:0")
+    music_dur = probe_duration(audio_path, "a:0")
+
+    music = f"volume={music_volume:.3f}"
+    if video_dur and music_dur:
+        end = min(video_dur, music_dur)
+        if end > MUSIC_FADE * 2:
+            music += f",afade=t=out:st={end - MUSIC_FADE:.3f}:d={MUSIC_FADE}"
+    # Müzik bittikten sonra sessizlikle doldur (video kısalmasın, ses başa sarmasın)
+    music += ",apad"
+
+    cmd = [
+        "ffmpeg", "-y", *FF_QUIET, "-threads", "1",
+        "-i", str(joined), "-i", str(audio_path),
+    ]
+
+    if keep_original_audio:
+        cmd += [
+            "-filter_complex",
+            f"[0:a]volume=1[original];"
+            f"[1:a]{music}[music];"
+            "[original][music]amix=inputs=2:duration=first:"
+            "dropout_transition=2[aout]",
+            "-map", "0:v:0", "-map", "[aout]",
+        ]
+    else:
+        cmd += [
+            "-filter_complex", f"[1:a]{music}[aout]",
+            "-map", "0:v:0", "-map", "[aout]",
+        ]
+
+    cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart"]
+    if video_dur:
+        cmd += ["-t", f"{video_dur:.3f}"]
+    cmd += ["-shortest", str(output)]
+    run(cmd)
+
+
 def build_video(job_id, job, sources, audio_path, width, height,
                 music_volume, keep_original_audio):
-    """Arka planda çalışır. Mantık /render ile aynı."""
+    """Arka planda çalışır."""
     with RENDER_SLOT:
         try:
             set_status(job_id, state="processing", done=0, total=len(sources))
             normalized = []
 
             for i, source in enumerate(sources):
-                probe = run([
-                    "ffprobe", "-v", "error",
-                    "-select_streams", "a:0",
-                    "-show_entries", "stream=codec_type",
-                    "-of", "csv=p=0", str(source)
-                ], timeout=60)
-
-                has_audio = bool(probe.stdout.strip())
                 target = job / f"clip_{i:03d}.mp4"
-
-                vf = (
-                    "fps=30,"
-                    f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-                    "setsar=1,format=yuv420p"
-                )
-
-                cmd = ["ffmpeg", "-y", *FF_QUIET,
-                       "-threads", "1", "-filter_threads", "1",
-                       "-i", str(source)]
-
-                if has_audio and keep_original_audio:
-                    cmd += [
-                        "-map", "0:v:0", "-map", "0:a:0",
-                        "-vf", vf, "-af", "aresample=44100,apad",
-                        "-c:a", "aac", "-b:a", "160k",
-                    ]
-                else:
-                    cmd += [
-                        "-f", "lavfi", "-i",
-                        "anullsrc=channel_layout=stereo:sample_rate=44100",
-                        "-map", "0:v:0", "-map", "1:a:0",
-                        "-vf", vf, "-c:a", "aac", "-b:a", "160k",
-                    ]
-
-                cmd += [
-                    "-threads", "1",
-                    "-c:v", "libx264", "-preset", "ultrafast",
-                    "-crf", "23", "-pix_fmt", "yuv420p",
-                    "-ar", "44100", "-ac", "2", "-shortest",
-                    str(target)
-                ]
-                run(cmd)
+                normalize_clip(source, target, width, height,
+                               keep_original_audio)
                 normalized.append(target)
                 set_status(job_id, done=i + 1)
 
                 # Yer kazanmak için işlenen kaynağı sil
                 source.unlink(missing_ok=True)
 
-            listing = job / "list.txt"
-            with listing.open("w", encoding="utf-8") as f:
-                for path in normalized:
-                    f.write(f"file '{path.name}'\n")
-
-            joined = job / "joined.mp4"
-            run([
-                "ffmpeg", "-y", *FF_QUIET, "-f", "concat", "-safe", "0",
-                "-i", listing.name, "-c", "copy", joined.name
-            ], cwd=str(job))
-
+            joined = concat_clips(job, normalized)
             output = job / "output.mp4"
-            cmd = [
-                "ffmpeg", "-y", *FF_QUIET, "-threads", "1",
-                "-i", str(joined),
-                "-stream_loop", "-1", "-i", str(audio_path),
-            ]
-
-            volume = f"{music_volume:.3f}"
-
-            if keep_original_audio:
-                cmd += [
-                    "-filter_complex",
-                    f"[0:a]volume=1[original];"
-                    f"[1:a]volume={volume}[music];"
-                    "[original][music]amix=inputs=2:duration=first:"
-                    "dropout_transition=2[aout]",
-                    "-map", "0:v:0", "-map", "[aout]",
-                ]
-            else:
-                cmd += [
-                    "-filter_complex", f"[1:a]volume={volume}[aout]",
-                    "-map", "0:v:0", "-map", "[aout]",
-                ]
-
-            cmd += [
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart", "-shortest", str(output)
-            ]
-            run(cmd)
+            mix_final(joined, audio_path, output,
+                      music_volume, keep_original_audio)
 
             # Ara dosyaları temizle, sadece output.mp4 kalsın
             for p in normalized:
@@ -249,7 +313,7 @@ def status(job_id: str):
         return dict(info)
 
 
-# ---------- ESKİ: mantık aynen duruyor ----------
+# ---------- ESKİ: tek istekte render (aynı yardımcıları kullanır) ----------
 @app.post("/render")
 async def render(
     clips: list[UploadFile] = File(...),
@@ -280,97 +344,19 @@ async def render(
             with source.open("wb") as f:
                 shutil.copyfileobj(clip.file, f)
 
-            probe = run([
-                "ffprobe", "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=codec_type",
-                "-of", "csv=p=0", str(source)
-            ], timeout=60)
-
-            has_audio = bool(probe.stdout.strip())
             target = job / f"clip_{i:03d}.mp4"
-
-            vf = (
-                "fps=30,"
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-                "setsar=1,format=yuv420p"
-            )
-
-            cmd = ["ffmpeg", "-y", *FF_QUIET,
-                   "-threads", "1", "-filter_threads", "1",
-                   "-i", str(source)]
-
-            if has_audio and keep_original_audio:
-                cmd += [
-                    "-map", "0:v:0", "-map", "0:a:0",
-                    "-vf", vf, "-af", "aresample=44100,apad",
-                    "-c:a", "aac", "-b:a", "160k",
-                ]
-            else:
-                cmd += [
-                    "-f", "lavfi", "-i",
-                    "anullsrc=channel_layout=stereo:sample_rate=44100",
-                    "-map", "0:v:0", "-map", "1:a:0",
-                    "-vf", vf, "-c:a", "aac", "-b:a", "160k",
-                ]
-
-            cmd += [
-                "-threads", "1",
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-crf", "23", "-pix_fmt", "yuv420p",
-                "-ar", "44100", "-ac", "2", "-shortest",
-                str(target)
-            ]
-            run(cmd)
+            normalize_clip(source, target, width, height, keep_original_audio)
             normalized.append(target)
 
-        audio_path = job / "music"
         suffix = Path(audio.filename or "music.mp3").suffix or ".mp3"
-        audio_path = audio_path.with_suffix(suffix)
+        audio_path = job / f"music{suffix}"
         with audio_path.open("wb") as f:
             shutil.copyfileobj(audio.file, f)
 
-        listing = job / "list.txt"
-        with listing.open("w", encoding="utf-8") as f:
-            for path in normalized:
-                f.write(f"file '{path.name}'\n")
-
-        joined = job / "joined.mp4"
-        run([
-            "ffmpeg", "-y", *FF_QUIET, "-f", "concat", "-safe", "0",
-            "-i", listing.name, "-c", "copy", joined.name
-        ], cwd=str(job))
-
+        joined = concat_clips(job, normalized)
         output = job / "output.mp4"
-        cmd = [
-            "ffmpeg", "-y", *FF_QUIET, "-threads", "1",
-            "-i", str(joined),
-            "-stream_loop", "-1", "-i", str(audio_path),
-        ]
-
-        volume = f"{music_volume:.3f}"
-
-        if keep_original_audio:
-            cmd += [
-                "-filter_complex",
-                f"[0:a]volume=1[original];"
-                f"[1:a]volume={volume}[music];"
-                "[original][music]amix=inputs=2:duration=first:"
-                "dropout_transition=2[aout]",
-                "-map", "0:v:0", "-map", "[aout]",
-            ]
-        else:
-            cmd += [
-                "-filter_complex", f"[1:a]volume={volume}[aout]",
-                "-map", "0:v:0", "-map", "[aout]",
-            ]
-
-        cmd += [
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", "-shortest", str(output)
-        ]
-        run(cmd)
+        mix_final(joined, audio_path, output,
+                  music_volume, keep_original_audio)
 
         return {"download_url": f"/download/{job_id}"}
 
