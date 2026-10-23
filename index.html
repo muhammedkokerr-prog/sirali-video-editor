@@ -31,6 +31,11 @@ input[type=range]{width:100%;accent-color:#60a5fa}
 .row label{margin:8px 0}
 #status{overflow-wrap:anywhere}
 #download{display:none;color:#93c5fd;font-weight:700;display:none;margin-top:12px}
+#warn{display:none;margin-top:14px;padding:14px;background:#422006;border:1px solid #b45309;border-radius:12px}
+#warn p{color:#fde68a;margin:0 0 12px}
+.warn-actions{display:flex;gap:8px}
+.warn-actions button{flex:1;padding:12px}
+#warnGo{background:#b45309}
 </style>
 </head>
 <body>
@@ -75,6 +80,13 @@ input[type=range]{width:100%;accent-color:#60a5fa}
 <h2>4. Videonu oluştur</h2>
 <p>Kliplerin sırası korunur. Uzun projelerin işlenmesi daha fazla zaman alabilir.</p>
 <button class="primary" id="export">MP4 videomu oluştur</button>
+<div id="warn" role="alert">
+<p id="warnText"></p>
+<div class="warn-actions">
+<button id="warnCancel" type="button">Vazgeç, düzelteyim</button>
+<button id="warnGo" type="button">Yine de oluştur</button>
+</div>
+</div>
 <p id="status" role="status">Videolarını ve müziğini seçmeye hazırsın.</p>
 <a id="download" href="">⬇ Videonu indir</a>
 </section>
@@ -87,11 +99,17 @@ const list=document.querySelector("#clipList");
 const status=document.querySelector("#status");
 const exportButton=document.querySelector("#export");
 const downloadLink=document.querySelector("#download");
+const warnBox=document.querySelector("#warn");
+const warnText=document.querySelector("#warnText");
+const warnGo=document.querySelector("#warnGo");
+const warnCancel=document.querySelector("#warnCancel");
 let clips=[];
 let dragIndex=null;
 
 const POLL_MS=2000;
 const JOB_KEY="sve_job_id";
+// Klip toplamı ile müzik arasındaki fark bu süreden küçükse uyarı verilmez (saniye)
+const TOLERANCE_SEC=1;
 
 class FatalError extends Error{}
 
@@ -185,6 +203,89 @@ document.querySelector("#volume").addEventListener("input",e=>{
 function saveJob(id){try{localStorage.setItem(JOB_KEY,id);}catch(e){}}
 function getJob(){try{return localStorage.getItem(JOB_KEY);}catch(e){return null;}}
 function clearJob(){try{localStorage.removeItem(JOB_KEY);}catch(e){}}
+
+/* ---------- süre kontrolü: klip toplamı ile müzik uyuşuyor mu? ---------- */
+function fmt(sec){
+  const s=Math.round(sec);
+  const m=Math.floor(s/60);
+  const r=s%60;
+  return m>0?m+" dk "+r+" sn":r+" sn";
+}
+
+// Dosyanın süresini tarayıcıdan okur (yüklemeden). Okunamazsa null döner.
+function readDuration(file,kind){
+  return new Promise(resolve=>{
+    const el=document.createElement(kind);
+    el.preload="metadata";
+    el.muted=true;
+    if(kind==="video")el.playsInline=true;
+    const url=URL.createObjectURL(file);
+    let finished=false;
+    let timer=null;
+    const finish=value=>{
+      if(finished)return;
+      finished=true;
+      clearTimeout(timer);
+      el.removeAttribute("src");
+      try{el.load();}catch(e){}
+      URL.revokeObjectURL(url);
+      resolve(value);
+    };
+    timer=setTimeout(()=>finish(null),8000);
+    el.onloadedmetadata=()=>{
+      const d=el.duration;
+      finish(Number.isFinite(d)&&d>0?d:null);
+    };
+    el.onerror=()=>finish(null);
+    el.src=url;
+  });
+}
+
+// Süreler okunamazsa null döner (kontrol atlanır, işlem engellenmez).
+async function checkDurations(audio){
+  let clipTotal=0;
+  for(const file of clips){
+    const d=await readDuration(file,"video");
+    if(d===null)return null;
+    clipTotal+=d;
+  }
+  const music=await readDuration(audio,"audio");
+  if(music===null)return null;
+  return {clipTotal,music};
+}
+
+function buildMismatchMessage(info){
+  const diff=info.music-info.clipTotal;
+  const head="Klipler toplam "+fmt(info.clipTotal)+", müzik "+fmt(info.music)+". ";
+  if(diff>TOLERANCE_SEC){
+    return head+"Klip yetersiz: müzik kliplerden yaklaşık "+fmt(diff)+
+      " uzun. Klip ekle ya da daha kısa bir müzik seç. "+
+      "Yine de oluşturursan müzik videonun sonunda kesilir.";
+  }
+  if(-diff>TOLERANCE_SEC){
+    const rest=document.querySelector("#keepAudio").checked
+      ?"kliplerin kendi sesiyle devam eder":"sessiz devam eder";
+    return head+"Klip fazla: klipler müzikten yaklaşık "+fmt(-diff)+
+      " uzun. Klip eksilt ya da daha uzun bir müzik seç. "+
+      "Yine de oluşturursan müzik bittikten sonra video "+rest+".";
+  }
+  return null;
+}
+
+function askUser(message){
+  return new Promise(resolve=>{
+    warnText.textContent=message;
+    warnBox.style.display="block";
+    const close=answer=>{
+      warnBox.style.display="none";
+      warnGo.onclick=null;
+      warnCancel.onclick=null;
+      resolve(answer);
+    };
+    warnGo.onclick=()=>close(true);
+    warnCancel.onclick=()=>close(false);
+  });
+}
 
 /* ---------- hata mesajını kısa ve anlaşılır yap ---------- */
 function friendlyHttpError(code,text){
@@ -293,9 +394,26 @@ exportButton.addEventListener("click",async()=>{
 
   exportButton.disabled=true;
   downloadLink.style.display="none";
-  status.textContent="Yükleme başlıyor...";
 
   try{
+    // 1) Süre kontrolü (yüklemeden önce, tarayıcıda)
+    status.textContent="Süreler kontrol ediliyor...";
+    const info=await checkDurations(audio);
+    if(info){
+      const message=buildMismatchMessage(info);
+      if(message){
+        status.textContent="Klip ve müzik süreleri uyuşmuyor.";
+        const proceed=await askUser(message);
+        if(!proceed){
+          status.textContent=
+            "Vazgeçildi. Klip veya müziği düzenleyip tekrar dene.";
+          return;
+        }
+      }
+    }
+
+    // 2) Yükle ve işle
+    status.textContent="Yükleme başlıyor...";
     const form=new FormData();
     clips.forEach((file,index)=>{
       form.append("clips",file,file.name||("clip_"+index+".mp4"));
